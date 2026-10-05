@@ -99,11 +99,11 @@ runs:
       run: |      
         shopt -s dotglob
         rm -rf ${{ inputs.action_path }}/.git
-
         mv -f ${{ inputs.action_path }} ${{ github.workspace }}/_site
         mkdir -p ${{ inputs.action_path }} && cp -R ${{ github.workspace }}/_site/. ${{ inputs.action_path }}/
   
     - uses: ikalnytskyi/action-setup-postgres@v7
+      if: env.REMOVE_RUNNER == 'false'
       id: postgres
       with:
         username: yoda
@@ -113,7 +113,41 @@ runs:
         postgres-version: "17"
         ssl: true
 
+    - name: 🪂 Install Freqtrafe
+      if: env.REMOVE_RUNNER == 'false'
+      shell: bash
+      env:
+        VERSION: "2025.12"
+      run: |
+        cd user_data/build_helpers
+        ./install_ta-lib.sh > /dev/null 2>&1 && rm -rf *.txt
+
+        # Download requirement files from Freqtrade
+        for f in requirements.txt requirements-dev.txt requirements-hyperopt.txt requirements-plot.txt requirements-freqai.txt requirements-freqai-rl.txt; do
+          curl -fsSLO --retry 5 --retry-delay 2 \
+          https://raw.githubusercontent.com/freqtrade/freqtrade/$VERSION/$f || true
+        done
+
+        pip install -qq --no-cache-dir -r ${{ github.workspace }}/user_data/build_helpers/requirements-plot.txt
+        pip install -qq --no-cache-dir -r ${{ github.workspace }}/user_data/build_helpers/requirements-hyperopt.txt
+        if [[ "$RUN_MODE" == "FreqAI" ]]; then
+          pip install -qq --no-cache-dir -r ${{ github.workspace }}/user_data/build_helpers/requirements-freqai-rl.txt
+          pip install -qq --no-cache-dir "torch==2.5.1" "torchvision==0.20.1" --force-reinstall
+        fi
+
+        pip install -qq --no-cache-dir ta "numpy<3.0" "aiodns<3.0" "freqtrade==$VERSION"
+        cd ${{ github.workspace }} && bash user_data/ft_client/test_client/feed.sh
+
+    - name: Upload downloaded data as artifact
+      uses: actions/upload-artifact@v6
+      if: env.REMOVE_RUNNER == 'false'
+      with:
+        name: freqtrade-data
+        path: user_data/data/
+
     - name: 🪂 Test postgres
+      if: env.REMOVE_RUNNER == 'false'
+      shell: bash
       env:
         CONNECTION_URI: ${{ steps.postgres.outputs.connection-uri }}
         SERVICE_NAME: ${{ steps.postgres.outputs.service-name }}
@@ -122,8 +156,8 @@ runs:
         EXPECTED_SERVICE_NAME: yoda
         EXPECTED_SERVER_VERSION: 17
         EXPECTED_SSL: true
-      shell: bash
       run: |
+        bash user_data/ft_client/test_client/feed.sh $RUN_MODE
         ##cd /home/runner/work/_actions/eq19/eq19/v2/integrations/tensorflow
         ##pip install -e python_projects/* && iree-import-tflite -h && iree-import-tf -h
 
@@ -135,9 +169,9 @@ runs:
 
         #cp ${{ github.workspace }}/.github/entrypoint/test.py . && python3 -m pytest -vv test.py
         #python ${{ github.workspace }}/web_programming/cc_exchanges.py
-        
+
     - name: 🚀 Initiate Feed Container
-      if: runner.os != 'Windows'
+      if: env.REMOVE_RUNNER == 'true'
       uses: devcontainers/ci@v0.3
       id: set_output
       with:
@@ -145,16 +179,17 @@ runs:
         skipContainerUserIdUpdate: true
         imageName: ${{ inputs.image_name }}
         configFile: _site/.devcontainer.json
-        runCmd: bash user_data/ft_client/test_client/feed.sh
-        push: ${{ env.RERUN_RUNNER == 'true' && 'always' || 'never' }}
+        #runCmd: bash user_data/ft_client/test_client/feed.sh
+        push: ${{ env.REMOVE_RUNNER == 'true' && 'always' || 'never' }}
         env: |
           ID=${{ env.ID }}
           GH_TOKEN=${{ env.GH_TOKEN }}
-          REMOTE_REPO=${{ env.REMOTE_REPO }}
-          BEARER=${{ steps.auth.outputs.id_token }}
+          REMOTE_REPO=${{ inputs.repository }}
+          REMOVE_RUNNER=${{ env.REMOVE_RUNNER }}
           TARGET_REPOSITORY=${{ env.TARGET_REPOSITORY }}
 
     - name: 🪂 Remove existing images
+      if: env.REMOVE_RUNNER == 'true'
       id: variables
       shell: bash
       run: |
@@ -167,3 +202,11 @@ runs:
             echo "deleted: ${{ inputs.image_name }}:${array[$i]}"
           fi
         done
+
+    - name: ⚧️ Rerun workflow if failed
+      if: ${{ failure() }}
+      shell: bash
+      run: |
+        [[ "$GITHUB_JOB" == "lexering" ]] && gh workflow run "main.yml" --repo "$REPO_NAME" \
+          --raw-field "RUN_MODE=$RUN_MODE" --raw-field "REMOVE_RUNNER=$REMOVE_RUNNER" \
+          --raw-field "REDUCE_EPOCH=$REDUCE_EPOCH" --raw-field "BYPASS_LEXERING=$BYPASS_LEXERING"
